@@ -20,6 +20,8 @@ from typing import (
     get_type_hints,
 )
 
+import torch
+
 from tango.common.det_hash import DetHashWithVersion
 from tango.common.exceptions import ConfigurationError
 from tango.common.lazy import Lazy
@@ -370,6 +372,8 @@ def _params_contain_step(o: Any) -> bool:
             return True
         else:
             return _params_contain_step(o.values())
+    elif isinstance(o, torch.Tensor):
+        return False
     elif isinstance(o, Iterable):
         return any(_params_contain_step(p) for p in o)
     else:
