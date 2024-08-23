@@ -403,7 +403,7 @@ class WandbWorkspace(Workspace):
         return Run(
             name=wandb_run.name,
             steps=step_name_to_info,
-            start_date=datetime.strptime(wandb_run.created_at, "%Y-%m-%dT%H:%M:%S").replace(
+            start_date=datetime.strptime(wandb_run.created_at, "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=pytz.utc
             ),
         )
