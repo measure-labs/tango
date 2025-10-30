@@ -1,3 +1,4 @@
+import json
 import logging
 import tempfile
 from datetime import datetime
@@ -8,7 +9,7 @@ from urllib.parse import ParseResult
 import pytz
 import wandb
 
-from tango.common.exceptions import StepStateError
+from tango.common.exceptions import ConfigurationError, StepStateError
 from tango.common.file_lock import FileLock
 from tango.common.util import exception_to_string, tango_cache_dir, utc_now_datetime
 from tango.step import Step
@@ -146,9 +147,10 @@ class WandbWorkspace(Workspace):
             step_name=step_or_unique_id.name if isinstance(step_or_unique_id, Step) else None,
         )
         if step_info is None:
+            if isinstance(step_or_unique_id, Step):
+                return StepInfo.new_from_step(step_or_unique_id)
             raise KeyError(step_or_unique_id)
-        else:
-            return step_info
+        return step_info
 
     def step_starting(self, step: Step) -> None:
         if wandb.run is not None:
@@ -390,9 +392,64 @@ class WandbWorkspace(Workspace):
         self,
         wandb_run: wandb.apis.public.Run,
     ) -> Run:
+        config = self._wandb_config_as_dict(wandb_run)
+        steps_config = self._maybe_parse_json_config_value(
+            config.get("steps"), wandb_run.name, "steps"
+        )
+        if not isinstance(steps_config, dict):
+            logger.debug(
+                "Unexpected 'steps' config type '%s' for run '%s'; treating as empty.",
+                type(steps_config).__name__,
+                wandb_run.name,
+            )
         step_name_to_info = {}
-        for step_name, step_info_dict in wandb_run.config["steps"].items():
-            step_info = StepInfo.from_json_dict(step_info_dict)
+        for step_name, raw_step_info in (
+            steps_config.items() if isinstance(steps_config, dict) else []
+        ):
+            step_info_dict = self._maybe_parse_json_config_value(
+                raw_step_info, wandb_run.name, f"steps.{step_name}"
+            )
+            if not isinstance(step_info_dict, dict):
+                logger.debug(
+                    "Skipping step '%s' in run '%s' because step info is not a dict (got %s).",
+                    step_name,
+                    wandb_run.name,
+                    type(step_info_dict).__name__,
+                )
+                continue
+            unique_id = step_info_dict.get("unique_id") or step_info_dict.get("id")
+            if unique_id is None:
+                logger.debug(
+                    "Step info for '%s' in run '%s' missing 'unique_id'; attempting to refresh from W&B.",
+                    step_name,
+                    wandb_run.name,
+                )
+                refreshed_step_info = self._get_updated_step_info(None, step_name=step_name)
+                if refreshed_step_info is None:
+                    logger.debug(
+                        "Unable to refresh step info for '%s' in run '%s'; skipping step.",
+                        step_name,
+                        wandb_run.name,
+                    )
+                    continue
+                step_name_to_info[step_name] = refreshed_step_info
+                continue
+            if "unique_id" not in step_info_dict and "id" in step_info_dict:
+                step_info_dict = dict(step_info_dict)
+                step_info_dict["unique_id"] = step_info_dict["id"]
+                step_info_dict.pop("id", None)
+            if "step_class_name" not in step_info_dict and unique_id is not None:
+                step_info_dict = dict(step_info_dict)
+                step_info_dict["step_class_name"] = str(unique_id).split("-", 1)[0]
+            try:
+                step_info = StepInfo.from_json_dict(step_info_dict)
+            except ConfigurationError:
+                logger.debug(
+                    "Skipping step '%s' in run '%s' because step info is missing required fields.",
+                    step_name,
+                    wandb_run.name,
+                )
+                continue
             if step_info.cacheable:
                 updated_step_info = self._get_updated_step_info(
                     step_info.unique_id, step_name=step_name
@@ -409,21 +466,51 @@ class WandbWorkspace(Workspace):
         )
 
     def _get_updated_step_info(
-        self, step_id: str, step_name: Optional[str] = None
+        self, step_id: Optional[str], step_name: Optional[str] = None
     ) -> Optional[StepInfo]:
         # First try to find the W&B run corresponding to the step. This will only
         # work if the step execution was started already.
         filters = {
             "config.job_type": RunKind.STEP.value,
-            "config.step_info.unique_id": step_id,
         }
+        if step_id is not None:
+            filters["config.step_info.unique_id"] = step_id
         if step_name is not None:
             filters["display_name"] = step_name
         for wandb_run in self.wandb_client.runs(
             f"{self.entity}/{self.project}",
             filters=filters,  # type: ignore
         ):
-            step_info = StepInfo.from_json_dict(wandb_run.config["step_info"])
+            config = self._wandb_config_as_dict(wandb_run)
+            step_info_data = self._maybe_parse_json_config_value(
+                config.get("step_info"), wandb_run.name, "step_info"
+            )
+            if not isinstance(step_info_data, dict):
+                logger.debug(
+                    "Unexpected 'step_info' config type '%s' for run '%s'.",
+                    type(step_info_data).__name__,
+                    wandb_run.name,
+                )
+                continue
+            if step_info_data.get("unique_id") is None:
+                fallback_unique_id = step_info_data.get("id") or getattr(wandb_run, "id", None)
+                if fallback_unique_id is not None:
+                    step_info_data = dict(step_info_data)
+                    step_info_data["unique_id"] = fallback_unique_id
+                    step_info_data.pop("id", None)
+            if step_info_data.get("step_class_name") is None:
+                fallback = step_info_data.get("unique_id")
+                if fallback is not None:
+                    step_info_data = dict(step_info_data)
+                    step_info_data["step_class_name"] = str(fallback).split("-", 1)[0]
+            try:
+                step_info = StepInfo.from_json_dict(step_info_data)
+            except ConfigurationError:
+                logger.debug(
+                    "Failed to deserialize step info for run '%s'; missing required fields. Skipping.",
+                    wandb_run.name,
+                )
+                continue
             # Might need to fix the step info the step failed and we failed to update the config.
             if step_info.start_time is None:
                 step_info.start_time = datetime.strptime(
@@ -440,6 +527,8 @@ class WandbWorkspace(Workspace):
 
         # If the step hasn't been started yet, we'll have to pull the step info from the
         # registered run.
+        if step_id is None:
+            return None
         filters = {
             "config.job_type": RunKind.TANGO_RUN.value,
             f"config._step_ids.{step_id}": True,
@@ -450,13 +539,105 @@ class WandbWorkspace(Workspace):
             f"{self.entity}/{self.project}",
             filters=filters,  # type: ignore
         ):
-            if step_name is not None:
-                step_info_data = wandb_run.config["steps"][step_name]
-            else:
-                step_info_data = next(
-                    d for d in wandb_run.config["steps"].values() if d["unique_id"] == step_id
+            config = self._wandb_config_as_dict(wandb_run)
+            steps_config = self._maybe_parse_json_config_value(
+                config.get("steps"), wandb_run.name, "steps"
+            )
+            if not isinstance(steps_config, dict):
+                logger.debug(
+                    "Unexpected 'steps' config type '%s' when looking up step '%s' on run '%s'.",
+                    type(steps_config).__name__,
+                    step_name or step_id,
+                    wandb_run.name,
                 )
-            step_info = StepInfo.from_json_dict(step_info_data)
+                continue
+            if step_name is not None:
+                step_info_data = self._maybe_parse_json_config_value(
+                    steps_config.get(step_name), wandb_run.name, f"steps.{step_name}"
+                )
+            else:
+                step_info_data = None
+                for candidate in steps_config.values():
+                    candidate_dict = self._maybe_parse_json_config_value(
+                        candidate, wandb_run.name, "steps"
+                    )
+                    if isinstance(candidate_dict, dict) and (
+                        candidate_dict.get("unique_id") or candidate_dict.get("id")
+                    ) == step_id:
+                        step_info_data = candidate_dict
+                        break
+            if not isinstance(step_info_data, dict):
+                continue
+            if "unique_id" not in step_info_data and "id" in step_info_data:
+                step_info_data = dict(step_info_data)
+                step_info_data["unique_id"] = step_info_data["id"]
+                step_info_data.pop("id", None)
+            if step_info_data.get("unique_id") is None and step_id is not None:
+                step_info_data = dict(step_info_data)
+                step_info_data["unique_id"] = step_id
+            if step_info_data.get("unique_id") is None:
+                logger.debug(
+                    "Resolved step info for '%s' (unique_id '%s') still missing unique ID; skipping.",
+                    step_name or "<unknown>",
+                    step_id,
+                )
+                continue
+            if step_info_data.get("step_class_name") is None:
+                fallback = step_info_data.get("unique_id")
+                if fallback is not None:
+                    step_info_data = dict(step_info_data)
+                    step_info_data["step_class_name"] = str(fallback).split("-", 1)[0]
+            try:
+                step_info = StepInfo.from_json_dict(step_info_data)
+            except ConfigurationError:
+                logger.debug(
+                    "Step info for '%s' (unique_id '%s') missing required fields; skipping.",
+                    step_name or "<unknown>",
+                    step_id,
+                )
+                continue
             return step_info
 
         return None
+
+    def _wandb_config_as_dict(self, wandb_run: wandb.apis.public.Run) -> Dict[str, Any]:
+        raw_config = wandb_run.config
+        if raw_config is None:
+            return {}
+        if isinstance(raw_config, dict):
+            return raw_config
+        if hasattr(raw_config, "to_dict"):
+            try:
+                converted = raw_config.to_dict()
+            except TypeError:
+                converted = None
+            if isinstance(converted, dict):
+                return converted
+        if hasattr(raw_config, "items"):
+            try:
+                return {k: v for k, v in raw_config.items()}
+            except TypeError:
+                pass
+        if isinstance(raw_config, str):
+            parsed = self._maybe_parse_json_config_value(raw_config, wandb_run.name, "config")
+            if isinstance(parsed, dict):
+                return parsed
+        try:
+            return dict(raw_config)  # type: ignore[arg-type]
+        except Exception:
+            logger.debug("Falling back to empty config for run '%s'.", wandb_run.name)
+            return {}
+
+    def _maybe_parse_json_config_value(
+        self, value: Any, run_name: str, field_name: str
+    ) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                logger.debug(
+                    "Failed to JSON-decode '%s' for run '%s'; leaving original value.",
+                    field_name,
+                    run_name,
+                )
+        return value

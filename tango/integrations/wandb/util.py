@@ -22,6 +22,9 @@ def is_missing_artifact_error(err: WandbError):
     if re.search(r"^artifact '.*' not found in '.*'$", err.message):
         return True
 
+    if re.search(r"^artifact membership '.*' not found in '.*'$", err.message):
+        return True
+
     return ("does not contain artifact" in err.message) or (
         "Unable to fetch artifact with name" in err.message
     )
