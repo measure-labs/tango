@@ -1,9 +1,10 @@
 import json
 import logging
 import tempfile
+from collections.abc import Mapping, Iterator as IteratorABC
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional, TypeVar, Union
+from typing import Any, Dict, Iterable, Optional, TypeVar, Union
 from urllib.parse import ParseResult
 
 import pytz
@@ -23,6 +24,30 @@ from .util import RunKind, check_environment
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_wandb_time(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=pytz.utc)
+    if isinstance(value, str):
+        try:
+            parsed_iso = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed_iso = None
+        if parsed_iso is not None:
+            return (
+                parsed_iso.astimezone(pytz.utc)
+                if parsed_iso.tzinfo
+                else parsed_iso.replace(tzinfo=pytz.utc)
+            )
+        stripped = value.rstrip("Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                parsed = datetime.strptime(stripped, fmt)
+            except ValueError:
+                continue
+            return parsed.replace(tzinfo=pytz.utc)
+    return None
 
 
 @Workspace.register("wandb")
@@ -243,7 +268,7 @@ class WandbWorkspace(Workspace):
             if step.cache_results:
                 self.step_cache[step] = result
                 if hasattr(result, "__next__"):
-                    assert isinstance(result, Iterator)
+                    assert isinstance(result, IteratorABC)
                     # Caching the iterator will consume it, so we write it to the
                     # cache and then read from the cache for the return value.
                     result = self.step_cache[step]
@@ -376,15 +401,28 @@ class WandbWorkspace(Workspace):
         return runs
 
     def registered_run(self, name: str) -> Run:
-        matching_runs = list(
+        def _matches_display_name(run: wandb.apis.public.Run) -> bool:
+            return getattr(run, "name", None) == name
+
+        runs_with_display_filter = list(
             self.wandb_client.runs(
                 f"{self.entity}/{self.project}",
                 filters={"display_name": name, "config.job_type": RunKind.TANGO_RUN.value},  # type: ignore
             )
         )
+        matching_runs = [run for run in runs_with_display_filter if _matches_display_name(run)]
+        if not matching_runs:
+            matching_runs = [
+                run
+                for run in self.wandb_client.runs(
+                    f"{self.entity}/{self.project}",
+                    filters={"config.job_type": RunKind.TANGO_RUN.value},  # type: ignore
+                )
+                if _matches_display_name(run)
+            ]
         if not matching_runs:
             raise KeyError(f"Run '{name}' not found in workspace")
-        elif len(matching_runs) > 1:
+        if len(matching_runs) > 1:
             raise ValueError(f"Found more than one run named '{name}' in W&B project")
         return self._get_run_from_wandb_run(matching_runs[0])
 
@@ -396,7 +434,7 @@ class WandbWorkspace(Workspace):
         steps_config = self._maybe_parse_json_config_value(
             config.get("steps"), wandb_run.name, "steps"
         )
-        if not isinstance(steps_config, dict):
+        if not isinstance(steps_config, Mapping):
             logger.debug(
                 "Unexpected 'steps' config type '%s' for run '%s'; treating as empty.",
                 type(steps_config).__name__,
@@ -404,12 +442,12 @@ class WandbWorkspace(Workspace):
             )
         step_name_to_info = {}
         for step_name, raw_step_info in (
-            steps_config.items() if isinstance(steps_config, dict) else []
+            steps_config.items() if isinstance(steps_config, Mapping) else []
         ):
             step_info_dict = self._maybe_parse_json_config_value(
                 raw_step_info, wandb_run.name, f"steps.{step_name}"
             )
-            if not isinstance(step_info_dict, dict):
+            if not isinstance(step_info_dict, Mapping):
                 logger.debug(
                     "Skipping step '%s' in run '%s' because step info is not a dict (got %s).",
                     step_name,
@@ -457,12 +495,19 @@ class WandbWorkspace(Workspace):
                 if updated_step_info is not None:
                     step_info = updated_step_info
             step_name_to_info[step_name] = step_info
+        start_date = _parse_wandb_time(
+            getattr(wandb_run, "created_at", getattr(wandb_run, "createdAt", None))
+        )
+        if start_date is None:
+            logger.debug(
+                "Run '%s' missing created_at; defaulting start_date to now (UTC).",
+                wandb_run.name,
+            )
+            start_date = utc_now_datetime()
         return Run(
             name=wandb_run.name,
             steps=step_name_to_info,
-            start_date=datetime.strptime(wandb_run.created_at, "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=pytz.utc
-            ),
+            start_date=start_date,
         )
 
     def _get_updated_step_info(
@@ -477,15 +522,30 @@ class WandbWorkspace(Workspace):
             filters["config.step_info.unique_id"] = step_id
         if step_name is not None:
             filters["display_name"] = step_name
-        for wandb_run in self.wandb_client.runs(
-            f"{self.entity}/{self.project}",
-            filters=filters,  # type: ignore
-        ):
+        runs = list(
+            self.wandb_client.runs(
+                f"{self.entity}/{self.project}",
+                filters=filters,  # type: ignore
+            )
+        )
+        if step_name is not None:
+            runs = [run for run in runs if getattr(run, "name", None) == step_name]
+            if not runs:
+                fallback_filters = {k: v for k, v in filters.items() if k != "display_name"}
+                runs = [
+                    run
+                    for run in self.wandb_client.runs(
+                        f"{self.entity}/{self.project}",
+                        filters=fallback_filters,  # type: ignore
+                    )
+                    if getattr(run, "name", None) == step_name
+                ]
+        for wandb_run in runs:
             config = self._wandb_config_as_dict(wandb_run)
             step_info_data = self._maybe_parse_json_config_value(
                 config.get("step_info"), wandb_run.name, "step_info"
             )
-            if not isinstance(step_info_data, dict):
+            if not isinstance(step_info_data, Mapping):
                 logger.debug(
                     "Unexpected 'step_info' config type '%s' for run '%s'.",
                     type(step_info_data).__name__,
@@ -513,14 +573,18 @@ class WandbWorkspace(Workspace):
                 continue
             # Might need to fix the step info the step failed and we failed to update the config.
             if step_info.start_time is None:
-                step_info.start_time = datetime.strptime(
-                    wandb_run.created_at, "%Y-%m-%dT%H:%M:%S"
-                ).replace(tzinfo=pytz.utc)
-            if wandb_run.state in {"failed", "finished"}:
+                start_time = _parse_wandb_time(
+                    getattr(wandb_run, "created_at", getattr(wandb_run, "createdAt", None))
+                )
+                if start_time is not None:
+                    step_info.start_time = start_time
+            if wandb_run.state in {"failed", "finished", "crashed"}:
                 if step_info.end_time is None:
-                    step_info.end_time = datetime.strptime(
-                        wandb_run.heartbeatAt, "%Y-%m-%dT%H:%M:%S"
-                    ).replace(tzinfo=pytz.utc)
+                    heartbeat_at = _parse_wandb_time(
+                        getattr(wandb_run, "heartbeatAt", getattr(wandb_run, "heartbeat_at", None))
+                    )
+                    if heartbeat_at is not None:
+                        step_info.end_time = heartbeat_at
                 if wandb_run.state == "failed" and step_info.error is None:
                     step_info.error = "Exception"
             return step_info
@@ -543,7 +607,7 @@ class WandbWorkspace(Workspace):
             steps_config = self._maybe_parse_json_config_value(
                 config.get("steps"), wandb_run.name, "steps"
             )
-            if not isinstance(steps_config, dict):
+            if not isinstance(steps_config, Mapping):
                 logger.debug(
                     "Unexpected 'steps' config type '%s' when looking up step '%s' on run '%s'.",
                     type(steps_config).__name__,
@@ -561,12 +625,12 @@ class WandbWorkspace(Workspace):
                     candidate_dict = self._maybe_parse_json_config_value(
                         candidate, wandb_run.name, "steps"
                     )
-                    if isinstance(candidate_dict, dict) and (
+                    if isinstance(candidate_dict, Mapping) and (
                         candidate_dict.get("unique_id") or candidate_dict.get("id")
                     ) == step_id:
                         step_info_data = candidate_dict
                         break
-            if not isinstance(step_info_data, dict):
+            if not isinstance(step_info_data, Mapping):
                 continue
             if "unique_id" not in step_info_data and "id" in step_info_data:
                 step_info_data = dict(step_info_data)
