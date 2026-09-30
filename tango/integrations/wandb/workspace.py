@@ -1,11 +1,12 @@
 import json
 import logging
 import tempfile
-from collections.abc import Mapping, Iterator as IteratorABC
+from collections.abc import Iterator as IteratorABC
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, TypeVar, Union
-from urllib.parse import ParseResult
+from urllib.parse import ParseResult, parse_qs, urlencode
 
 import pytz
 import wandb
@@ -18,6 +19,7 @@ from tango.step_cache import StepCache
 from tango.step_info import StepInfo, StepState
 from tango.workspace import Run, Workspace
 
+from .reliability import init_wandb_run, retry_wandb, wandb_client, wandb_retry
 from .step_cache import WandbStepCache
 from .util import RunKind, check_environment
 
@@ -64,6 +66,10 @@ class WandbWorkspace(Workspace):
 
     :param project: The W&B project to use for the workspace.
     :param entity: The W&B entity (user or organization account) to use for the workspace.
+    :param upload_timeout: Maximum seconds to wait for each step artifact upload to complete.
+        Defaults to ``None`` (no completion deadline). Transport failures have their own
+        bounded retry budget. This can also be set in the workspace URL, e.g.
+        ``wandb://entity/project?upload_timeout=600``.
 
     .. tip::
         Registered as a :class:`~tango.workspace.Workspace` under the name "wandb".
@@ -90,12 +96,16 @@ class WandbWorkspace(Workspace):
                 METADATA = {"artifact_kind": "model"}
     """
 
-    def __init__(self, project: str, entity: Optional[str] = None):
+    def __init__(
+        self, project: str, entity: Optional[str] = None, upload_timeout: Optional[int] = None
+    ):
         check_environment()
         super().__init__()
         self.project = project
         self._entity = entity
-        self.cache = WandbStepCache(project=self.project, entity=self.entity)
+        self.cache = WandbStepCache(
+            project=self.project, entity=self.entity, upload_timeout=upload_timeout
+        )
         self.steps_dir = tango_cache_dir() / "wandb_workspace"
         self.locks: Dict[Step, FileLock] = {}
         self._running_step_info: Dict[str, StepInfo] = {}
@@ -107,6 +117,9 @@ class WandbWorkspace(Workspace):
         """
         out = super().__getstate__()
         out["locks"] = {}
+        out["_running_step_info"] = {}
+        out.pop("_wandb_client", None)
+        out.pop("_wandb_client_pid", None)
         return out
 
     @property
@@ -114,7 +127,7 @@ class WandbWorkspace(Workspace):
         overrides = {"project": self.project}
         if self._entity is not None:
             overrides["entity"] = self._entity
-        return wandb.Api(overrides=overrides)
+        return wandb_client(self, overrides)
 
     @property
     def entity(self) -> str:
@@ -122,7 +135,10 @@ class WandbWorkspace(Workspace):
 
     @property
     def url(self) -> str:
-        return f"wandb://{self.entity}/{self.project}"
+        url = f"wandb://{self.entity}/{self.project}"
+        if self.cache.upload_timeout is not None:
+            url += "?" + urlencode({"upload_timeout": self.cache.upload_timeout})
+        return url
 
     @classmethod
     def from_parsed_url(cls, parsed_url: ParseResult) -> Workspace:
@@ -130,7 +146,9 @@ class WandbWorkspace(Workspace):
         project = parsed_url.path
         if project:
             project = project.strip("/")
-        return cls(project=project, entity=entity)
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
+        upload_timeout = int(query["upload_timeout"][0]) if "upload_timeout" in query else None
+        return cls(project=project, entity=entity, upload_timeout=upload_timeout)
 
     @property
     def step_cache(self) -> StepCache:
@@ -190,18 +208,30 @@ class WandbWorkspace(Workspace):
         lock.acquire_with_updates(desc=f"acquiring lock for '{step.name}'")
         self.locks[step] = lock
 
-        step_info = self._get_updated_step_info(step.unique_id) or StepInfo.new_from_step(step)
-        if step_info.state not in {StepState.INCOMPLETE, StepState.FAILED, StepState.UNCACHEABLE}:
-            raise StepStateError(
-                step,
-                step_info.state,
-                context="If you are certain the step is not running somewhere else, delete the lock "
-                f"file at {lock_path}.",
-            )
-
         try:
+            step_info = self._get_updated_step_info(step.unique_id) or StepInfo.new_from_step(step)
+            if step_info.state not in {
+                StepState.INCOMPLETE,
+                StepState.FAILED,
+                StepState.UNCACHEABLE,
+            }:
+                raise StepStateError(
+                    step,
+                    step_info.state,
+                    context="If you are certain the step is not running somewhere else, delete the lock "
+                    f"file at {lock_path}.",
+                )
+
+            # Keep local state until either success or failure is fully handled.
+            # Failure reporting must not depend on another successful API query.
+            step_info.start_time = utc_now_datetime()
+            step_info.end_time = None
+            step_info.error = None
+            step_info.result_location = None
+            self._running_step_info[step.unique_id] = step_info
+
             # Initialize W&B run for the step.
-            wandb.init(
+            init_wandb_run(
                 name=step_info.step_name,
                 job_type=RunKind.STEP.value,
                 group=step.unique_id,
@@ -240,15 +270,14 @@ class WandbWorkspace(Workspace):
                 self.cache.use_step_result_artifact(dependency)
 
             # Update StepInfo to mark as running.
-            step_info.start_time = utc_now_datetime()
-            step_info.end_time = None
-            step_info.error = None
-            step_info.result_location = None
-            wandb.run.config.update({"step_info": step_info.to_json_dict()}, allow_val_change=True)
-            self._running_step_info[step.unique_id] = step_info
-        except:  # noqa: E722
-            lock.release()
-            del self.locks[step]
+            wandb_retry(
+                lambda: wandb.run.config.update(
+                    {"step_info": step_info.to_json_dict()}, allow_val_change=True
+                ),
+                description=f"record startup for {step.name}",
+            )
+        except BaseException as error:
+            self.step_failed(step, error)
             raise
 
     def step_finished(self, step: Step, result: T) -> T:
@@ -264,60 +293,67 @@ class WandbWorkspace(Workspace):
         if step_info is None:
             raise KeyError(step.unique_id)
 
-        try:
-            if step.cache_results:
-                self.step_cache[step] = result
-                if hasattr(result, "__next__"):
-                    assert isinstance(result, IteratorABC)
-                    # Caching the iterator will consume it, so we write it to the
-                    # cache and then read from the cache for the return value.
-                    result = self.step_cache[step]
-                step_info.result_location = self.cache.get_step_result_artifact_url(step)
-            else:
-                # Create an empty artifact in order to build the DAG in W&B.
-                self.cache.create_step_result_artifact(step)
+        if step.cache_results:
+            self.step_cache[step] = result
+            if hasattr(result, "__next__"):
+                assert isinstance(result, IteratorABC)
+                # Caching the iterator consumes it; read the persisted result.
+                result = self.step_cache[step]
+            step_info.result_location = self.cache.get_step_result_artifact_url(step)
+        else:
+            self.cache.create_step_result_artifact(step)
 
-            step_info.end_time = utc_now_datetime()
-            wandb.run.config.update({"step_info": step_info.to_json_dict()}, allow_val_change=True)
+        step_info.end_time = utc_now_datetime()
+        wandb_retry(
+            lambda: wandb.run.config.update(
+                {"step_info": step_info.to_json_dict()}, allow_val_change=True
+            ),
+            description=f"record completion for {step.name}",
+        )
 
-            # Finalize the step's W&B run.
-            wandb.finish()
-        finally:
-            self.locks[step].release()
-            del self.locks[step]
-            if step.unique_id in self._running_step_info:
-                del self._running_step_info[step.unique_id]
+        # On error the caller invokes step_failed(), which still needs the
+        # step info and lock. Release them here only after successful completion.
+        wandb.finish()
+        self._release_step(step)
 
         return result
 
     def step_failed(self, step: Step, e: BaseException) -> None:
-        if wandb.run is None:
-            raise RuntimeError(
-                f"{self.__class__.__name__}.step_failed() called outside of a W&B run. "
-                f"Did you forget to call {self.__class__.__name__}.step_starting() first?"
-            )
-
-        step_info = self._running_step_info.get(step.unique_id) or self._get_updated_step_info(
-            step.unique_id
-        )
-        if step_info is None:
-            raise KeyError(step.unique_id)
-
+        step_info = self._running_step_info.get(step.unique_id)
         try:
-            # Update StepInfo, marking the step as failed.
-            if step_info.state != StepState.RUNNING:
-                raise StepStateError(step, step_info.state)
-            step_info.end_time = utc_now_datetime()
-            step_info.error = exception_to_string(e)
-            wandb.run.config.update({"step_info": step_info.to_json_dict()}, allow_val_change=True)
-
-            # Finalize the step's W&B run.
-            wandb.finish(exit_code=1)
+            # Uncacheable steps always report UNCACHEABLE, even while running.
+            # A completion failure can also have already set end_time.
+            if step_info is not None:
+                step_info.end_time = utc_now_datetime()
+                step_info.error = exception_to_string(e)
+                if wandb.run is not None:
+                    wandb_retry(
+                        lambda: wandb.run.config.update(
+                            {"step_info": step_info.to_json_dict()}, allow_val_change=True
+                        ),
+                        description=f"record failure for {step.name}",
+                    )
+        except Exception:
+            logger.exception(
+                "Unable to record failure for step '%s'; retaining original error", step.name
+            )
         finally:
-            self.locks[step].release()
-            del self.locks[step]
-            if step.unique_id in self._running_step_info:
-                del self._running_step_info[step.unique_id]
+            # Only close a run owned by this step, not another caller's run.
+            if step_info is not None and wandb.run is not None:
+                try:
+                    wandb.finish(exit_code=1)
+                except Exception:
+                    logger.exception("Unable to finish failed W&B run for step '%s'", step.name)
+            self._release_step(step)
+
+    def _release_step(self, step: Step) -> None:
+        self._running_step_info.pop(step.unique_id, None)
+        lock = self.locks.pop(step, None)
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception("Unable to release lock for step '%s'", step.name)
 
     def remove_step(self, step_unique_id: str):
         """
@@ -334,7 +370,7 @@ class WandbWorkspace(Workspace):
         wandb_run_id: str
         wandb_run_name: str
         with tempfile.TemporaryDirectory() as temp_dir_name:
-            with wandb.init(  # type: ignore[union-attr]
+            with init_wandb_run(
                 job_type=RunKind.TANGO_RUN.value,
                 entity=self.entity,
                 project=self.project,
@@ -363,9 +399,15 @@ class WandbWorkspace(Workspace):
                     step_ids[step.unique_id] = True
 
                 # Update config with step info.
-                wandb_run.config.update({"steps": step_name_to_info, "_step_ids": step_ids})
+                wandb_retry(
+                    lambda: wandb_run.config.update(
+                        {"steps": step_name_to_info, "_step_ids": step_ids}
+                    ),
+                    description="register step graph",
+                )
 
                 # Update notes.
+                project_url = self.wandb_project_url
                 notes = "Tango run\n--------------"
                 cacheable_steps = {step for step in all_steps if step.cache_results}
                 if cacheable_steps:
@@ -380,7 +422,7 @@ class WandbWorkspace(Workspace):
                                 )
                             )
                         notes += "\n  \N{rightwards arrow with hook} "
-                        notes += f"{self.wandb_project_url}/runs/{step.unique_id}/overview\n"
+                        notes += f"{project_url}/runs/{step.unique_id}/overview\n"
                 wandb_run.notes = notes
 
         return self.registered_run(wandb_run_name)
@@ -388,7 +430,9 @@ class WandbWorkspace(Workspace):
     def _generate_run_suite_id(self) -> str:
         return wandb.util.generate_id()
 
+    @retry_wandb
     def registered_runs(self) -> Dict[str, Run]:
+        self.wandb_client.flush()
         runs: Dict[str, Run] = {}
         matching_runs = list(
             self.wandb_client.runs(
@@ -400,7 +444,10 @@ class WandbWorkspace(Workspace):
             runs[wandb_run.name] = self._get_run_from_wandb_run(wandb_run)
         return runs
 
+    @retry_wandb
     def registered_run(self, name: str) -> Run:
+        self.wandb_client.flush()
+
         def _matches_display_name(run: wandb.apis.public.Run) -> bool:
             return getattr(run, "name", None) == name
 
@@ -510,9 +557,12 @@ class WandbWorkspace(Workspace):
             start_date=start_date,
         )
 
+    @retry_wandb
     def _get_updated_step_info(
         self, step_id: Optional[str], step_name: Optional[str] = None
     ) -> Optional[StepInfo]:
+        # Reuse the authenticated client, but not stale run query results.
+        self.wandb_client.flush()
         # First try to find the W&B run corresponding to the step. This will only
         # work if the step execution was started already.
         filters = {
@@ -625,9 +675,10 @@ class WandbWorkspace(Workspace):
                     candidate_dict = self._maybe_parse_json_config_value(
                         candidate, wandb_run.name, "steps"
                     )
-                    if isinstance(candidate_dict, Mapping) and (
-                        candidate_dict.get("unique_id") or candidate_dict.get("id")
-                    ) == step_id:
+                    if (
+                        isinstance(candidate_dict, Mapping)
+                        and (candidate_dict.get("unique_id") or candidate_dict.get("id")) == step_id
+                    ):
                         step_info_data = candidate_dict
                         break
             if not isinstance(step_info_data, Mapping):
@@ -692,9 +743,7 @@ class WandbWorkspace(Workspace):
             logger.debug("Falling back to empty config for run '%s'.", wandb_run.name)
             return {}
 
-    def _maybe_parse_json_config_value(
-        self, value: Any, run_name: str, field_name: str
-    ) -> Any:
+    def _maybe_parse_json_config_value(self, value: Any, run_name: str, field_name: str) -> Any:
         if isinstance(value, str):
             try:
                 return json.loads(value)
