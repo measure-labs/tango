@@ -484,7 +484,13 @@ class Step(Registrable, Generic[T]):
                 result = workspace.step_finished(self, result)
             except BaseException as e:
                 self.log_failure(e)
-                workspace.step_failed(self, e)
+                try:
+                    workspace.step_failed(self, e)
+                except Exception:
+                    self.logger.exception(
+                        "Unable to report failure of step '%s'; retaining original exception",
+                        self.name,
+                    )
                 raise
 
             self.log_finished()
