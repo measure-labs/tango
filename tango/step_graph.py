@@ -88,17 +88,27 @@ class StepGraph(Mapping[str, Step]):
         return ordered_steps
 
     def _sanity_check(self) -> None:
+        # Reuse direct dependencies across traversals in this check only. Step
+        # arguments may still be changed by callers after graph construction.
+        dependencies: Dict[Step, Set[Step]] = {}
         for step in self.parsed_steps.values():
             if step.cache_results:
-                nondeterministic_dependencies = [
-                    s for s in step.recursive_dependencies if not s.DETERMINISTIC
-                ]
-                if len(nondeterministic_dependencies) > 0:
-                    nd_step = nondeterministic_dependencies[0]
-                    logger.warning(
-                        f"Task {step.name} is set to cache results, but depends on non-deterministic "
-                        f"step {nd_step.name}. This will produce confusing results."
-                    )
+                seen: Set[Step] = set()
+                pending = [step]
+                while pending:
+                    current = pending.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    if current is not step and not current.DETERMINISTIC:
+                        logger.warning(
+                            f"Task {step.name} is set to cache results, but depends on non-deterministic "
+                            f"step {current.name}. This will produce confusing results."
+                        )
+                        break
+                    if current not in dependencies:
+                        dependencies[current] = current.dependencies
+                    pending.extend(dependencies[current])
 
     @classmethod
     def from_params(cls: Type["StepGraph"], params: Dict[str, Params]) -> "StepGraph":  # type: ignore[override]

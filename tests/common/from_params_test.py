@@ -525,6 +525,22 @@ class TestFromParams(TangoTestCase):
 
         Testing.from_params(Params({"lazy_object": {"string": test_string}}))
 
+    def test_existing_step_is_not_copied(self):
+        class Producer(Step):
+            def run(self) -> int:  # type: ignore[override]
+                return 3
+
+            def __deepcopy__(self, memo):
+                raise AssertionError("Type-checking a step must not copy its upstream graph")
+
+        class Container(FromParams):
+            def __init__(self, number: int):
+                self.number = number
+
+        producer = Producer(step_name="producer")
+        container = Container.from_params({"number": producer})
+        assert container.number is producer
+
     def test_lazy_and_from_params_can_be_pickled(self):
         import pickle
 

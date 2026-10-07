@@ -105,7 +105,45 @@ class TestStepGraph(TangoTestCase):
         }
         step_graph = StepGraph.from_params(deepcopy(config))  # type: ignore[arg-type]
         assert [s.name for s in step_graph["added"].dependencies] == ["list"]
+        assert step_graph["added"].config["b_number"] == config["added"]["b_number"]
+        assert step_graph["added"].kwargs["b_number"].step is step_graph["list"]
         assert step_graph.to_config() == config
+
+    def test_sanity_check_reuses_dependency_lookups(self):
+        class CountingStep(AddNumbersStep):
+            dependency_lookups = 0
+
+            @property
+            def dependencies(self):
+                self.dependency_lookups += 1
+                return super().dependencies
+
+        steps = {}
+        for i in range(10):
+            name = f"step{i}"
+            steps[name] = CountingStep(
+                a_number=steps[f"step{i - 1}"] if i else 0, b_number=1, step_name=name
+            )
+        StepGraph(steps)
+        # One lookup to check ordering and one for the sanity check, regardless
+        # of the number of downstream steps sharing each dependency.
+        assert all(step.dependency_lookups <= 2 for step in steps.values())
+
+    def test_sanity_check_sees_changed_dependencies(self, caplog):
+        class NonDeterministicStep(StringStep):
+            DETERMINISTIC = False
+            CACHEABLE = False
+
+        source = StringStep(result="hello", step_name="source")
+        target = ConcatStringsStep(string1=source, string2="world", step_name="target")
+        graph = StepGraph({"source": source, "target": target})
+        assert "non-deterministic" not in caplog.text
+
+        source.kwargs["result"] = NonDeterministicStep(result="random", step_name="random")
+        graph._sanity_check()
+        assert (
+            "Task target is set to cache results, but depends on non-deterministic" in caplog.text
+        )
 
     def test_with_forced_dependencies(self):
         config = {

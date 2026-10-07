@@ -415,7 +415,10 @@ def construct_arg(
         # If we think it might be a step, we try parsing as a step _first_.
         # Parsing as a non-step always succeeds, because it will fall back to returning a dict.
         # So we can't try parsing as a non-step first.
-        backup_params = deepcopy(popped_params)
+        # An existing step is only type-checked, so it cannot be consumed by parsing.
+        backup_params = (
+            popped_params if isinstance(popped_params, Step) else deepcopy(popped_params)
+        )
         try:
             return construct_arg(
                 class_name,
